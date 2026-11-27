@@ -1,23 +1,13 @@
 // Build 1: the domain core, running entirely in memory.
 // No server, no database. Just objects, Maps and rules.
-// The API (Build 4) uses src/services/ and src/repositories/ instead. This file
-// stays for `npm run demo` and shares its input rules via validation.js.
+// Build 4 replaces this file with services + repositories.
 
 import { newId, referenceCode } from './ids.js';
 import { Queue } from './waitlistQueue.js';
 import { DomainError } from './errors.js';
 import { summarizeEvent } from './eventSearch.js';
-import {
-  MAX_TICKETS_PER_BOOKING,
-  assertSeatsAvailable,
-  requireDate,
-  requireQuantity,
-  requireText,
-  requireWholeNumber,
-  seatsLeft,
-} from './validation.js';
 
-export { MAX_TICKETS_PER_BOOKING, seatsLeft };
+export const MAX_TICKETS_PER_BOOKING = 10;
 
 // Bookings in these states are holding seats. A cancelled one is not.
 const HOLDS_SEATS = new Set(['pending', 'paid']);
@@ -32,6 +22,20 @@ export function createStore() {
   };
 }
 
+function requireText(value, field) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new DomainError('VALIDATION', `${field} is required`);
+  }
+  return value.trim();
+}
+
+function requireWholeNumber(value, field, min) {
+  if (!Number.isInteger(value) || value < min) {
+    throw new DomainError('VALIDATION', `${field} must be a whole number of at least ${min}`);
+  }
+  return value;
+}
+
 function getTier(store, tierId) {
   const tier = store.tiers.get(tierId);
   if (!tier) throw new DomainError('NOT_FOUND', 'Ticket tier not found');
@@ -44,14 +48,31 @@ function getEvent(store, eventId) {
   return event;
 }
 
+function parseStartsAt(value) {
+  const datePart = typeof value === 'string' ? value.slice(0, 10) : '';
+  const isIsoDate = /^\d{4}-\d{2}-\d{2}$/.test(datePart)
+    && (value.length === 10 || value[10] === 'T');
+  const calendarDate = isIsoDate ? new Date(`${datePart}T00:00:00.000Z`) : undefined;
+  const date = new Date(value);
+
+  if (!isIsoDate
+    || Number.isNaN(calendarDate.getTime())
+    || calendarDate.toISOString().slice(0, 10) !== datePart
+    || Number.isNaN(date.getTime())) {
+    throw new DomainError('VALIDATION', 'startsAt must be a valid ISO date');
+  }
+  return date;
+}
+
 export function createEvent(store, { title, city, venue = '', startsAt, organizerId }) {
+  const date = parseStartsAt(startsAt);
   const event = {
     id: newId(),
     organizerId,
     title: requireText(title, 'Title'),
     city: requireText(city, 'City'),
     venue: String(venue).trim(),
-    startsAt: requireDate(startsAt, 'startsAt'),
+    startsAt: date.toISOString(),
     status: 'draft',
     tierIds: [],
   };
@@ -93,10 +114,21 @@ export function listEventSummaries(store, { publishedOnly = true } = {}) {
     .map((event) => summarizeEvent(event, event.tierIds.map((id) => store.tiers.get(id))));
 }
 
+export function seatsLeft(tier) {
+  return tier.capacity - tier.sold;
+}
+
 export function bookTickets(store, tierId, userId, quantity) {
   const tier = getTier(store, tierId);
-  requireQuantity(quantity);
-  assertSeatsAvailable(tier, quantity);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_TICKETS_PER_BOOKING) {
+    throw new DomainError('VALIDATION', `quantity must be between 1 and ${MAX_TICKETS_PER_BOOKING}`);
+  }
+
+  const left = seatsLeft(tier);
+  if (left < quantity) {
+    const message = left === 0 ? `${tier.name} is sold out` : `Only ${left} ticket(s) left in ${tier.name}`;
+    throw new DomainError('SOLD_OUT', message, { seatsLeft: left });
+  }
 
   tier.sold += quantity;
 
@@ -137,7 +169,9 @@ export function cancelBooking(store, reference) {
 
 export function joinWaitlist(store, tierId, userId, quantity) {
   const tier = getTier(store, tierId);
-  requireQuantity(quantity);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_TICKETS_PER_BOOKING) {
+    throw new DomainError('VALIDATION', `quantity must be between 1 and ${MAX_TICKETS_PER_BOOKING}`);
+  }
   if (seatsLeft(tier) >= quantity) {
     throw new DomainError('NOT_SOLD_OUT', 'Seats are available, so book them instead');
   }
